@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>看图朗读（静态版）</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>
+:root{--bg:#faf7f2;--card:#fff;--text:#1f1d1a;--sub:#6b665e;--accent:#c4501b;--accent-t:#fff;--line:#e6e0d6;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root{--bg:#171513;--card:#221f1c;--text:#f1ede6;--sub:#a09a90;--accent:#ea7a45;--accent-t:#1a1008;--line:#37322c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 -apple-system,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif}
+main{max-width:520px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:22px;margin:4px 0 2px}
+.sub{color:var(--sub);font-size:14px;margin:0 0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:14px}
+#preview{width:100%;max-height:300px;object-fit:contain;border-radius:10px;display:none;margin-bottom:10px}
+.btn{display:block;width:100%;border:0;border-radius:12px;padding:14px;font-size:17px;font-weight:600;background:var(--accent);color:var(--accent-t);text-align:center;cursor:pointer}
+.btn.ghost{background:transparent;color:var(--text);border:1px solid var(--line);font-weight:500}
+.row{display:flex;gap:10px;margin-top:10px}
+.row .btn{padding:12px}
+input[type=file]{display:none}
+#text{white-space:pre-wrap;font-size:19px;line-height:1.8;min-height:48px;outline:none}
+#status{color:var(--sub);font-size:14px;margin:0 0 8px}
+progress{width:100%;height:6px;display:none;margin-bottom:8px;accent-color:var(--accent)}
+label{font-size:14px;color:var(--sub);display:flex;align-items:center;gap:10px;margin-top:10px}
+input[type=range]{flex:1}
+select{font-size:15px;padding:6px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--text)}
+</style>
+</head>
+<body>
+<main>
+  <h1>看图朗读</h1>
+  <p class="sub">拍一张照片或选一张图片，自动识别中文并读出来。识别在浏览器内完成，图片不会上传。</p>
+
+  <div class="card">
+    <img id="preview" alt="">
+    <label class="btn" for="cam" style="margin:0;color:var(--accent-t)">📷 拍照朗读</label>
+    <input id="cam" type="file" accept="image/*" capture="environment">
+    <div class="row"><label class="btn ghost" for="pick" style="margin:0;color:var(--text)">🖼️ 从相册选图</label></div>
+    <input id="pick" type="file" accept="image/*">
+    <label>识别文字
+      <select id="ocrLang">
+        <option value="chi_sim+eng">简体中文</option>
+        <option value="chi_tra+eng">繁体中文</option>
+        <option value="chi_sim+chi_tra+eng">简繁混合（较慢）</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="card">
+    <p id="status">等待图片…（首次使用需下载约 10–20MB 语言包）</p>
+    <progress id="prog" max="1" value="0"></progress>
+    <div id="text" contenteditable="true"></div>
+    <div class="row">
+      <button class="btn" id="play">▶ 朗读</button>
+      <button class="btn ghost" id="stop">■ 停止</button>
+    </div>
+    <label>语速 <input type="range" id="rate" min="0.6" max="1.6" step="0.1" value="1"></label>
+    <label>口音
+      <select id="lang"><option value="zh-CN">普通话（简体）</option><option value="zh-TW">国语（台湾）</option><option value="zh-HK">粤语（香港）</option></select>
+    </label>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const statusEl = $("status"), textEl = $("text"), preview = $("preview"), prog = $("prog");
+let worker = null, workerLang = "", busy = false;
+
+const STEP = {
+  "loading tesseract core": "加载识别引擎…",
+  "initializing tesseract": "初始化…",
+  "loading language traineddata": "下载语言包…",
+  "initializing api": "准备中…",
+  "recognizing text": "识别中…"
+};
+function logger(m) {
+  statusEl.textContent = STEP[m.status] || m.status;
+  if (typeof m.progress === "number") { prog.style.display = "block"; prog.value = m.progress; }
+}
+
+async function getWorker(lang) {
+  if (worker && workerLang === lang) return worker;
+  if (worker) { await worker.terminate(); worker = null; }
+  worker = await Tesseract.createWorker(lang, 1, { logger });
+  workerLang = lang;
+  return worker;
+}
+
+// 缩图 + 灰阶 + 自动对比，提升识别率
+function prepare(file, max = 2000) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      const d = ctx.getImageData(0, 0, c.width, c.height), p = d.data;
+      let lo = 255, hi = 0;
+      for (let i = 0; i < p.length; i += 4) {
+        const g = 0.299 * p[i] + 0.587 * p[i + 1] + 0.114 * p[i + 2];
+        p[i] = g; if (g < lo) lo = g; if (g > hi) hi = g;
+      }
+      const s = hi > lo ? 255 / (hi - lo) : 1;
+      for (let i = 0; i < p.length; i += 4) {
+        const g = (p[i] - lo) * s; p[i] = p[i + 1] = p[i + 2] = g;
+      }
+      ctx.putImageData(d, 0, 0);
+      resolve({ canvas: c, url });
+    };
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+async function handle(file) {
+  if (!file || busy) return;
+  if (typeof Tesseract === "undefined") { statusEl.textContent = "识别引擎加载失败，请检查网络后重新整理页面。"; return; }
+  busy = true; speechSynthesis.cancel();
+  textEl.textContent = ""; statusEl.textContent = "处理图片…";
+  try {
+    const { canvas, url } = await prepare(file);
+    preview.src = url; preview.style.display = "block";
+    const w = await getWorker($("ocrLang").value);
+    const { data } = await w.recognize(canvas);
+    // 去掉中文字之间被误加的空白
+    const t = (data.text || "")
+      .replace(/(?<=[一-鿿　-〿＀-￯])[ \t]+(?=[一-鿿　-〿＀-￯])/g, "")
+      .trim();
+    textEl.textContent = t;
+    if (!t) statusEl.textContent = "没有识别到文字。";
+    else { statusEl.textContent = "识别完成，正在朗读…（文字可直接修改后再按朗读）"; speak(); }
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = "识别失败，请重试。";
+  } finally { busy = false; prog.style.display = "none"; }
+}
+
+function pickVoice(lang) {
+  const vs = speechSynthesis.getVoices();
+  return vs.find(v => v.lang.replace("_", "-") === lang) || vs.find(v => v.lang.toLowerCase().startsWith("zh"));
+}
+
+function speak() {
+  const t = textEl.innerText.trim();
+  if (!t) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(t);
+  u.lang = $("lang").value;
+  u.rate = parseFloat($("rate").value);
+  const v = pickVoice(u.lang); if (v) u.voice = v;
+  u.onend = () => { statusEl.textContent = "朗读完毕。"; };
+  speechSynthesis.speak(u);
+}
+
+$("cam").onchange = e => { handle(e.target.files[0]); e.target.value = ""; };
+$("pick").onchange = e => { handle(e.target.files[0]); e.target.value = ""; };
+$("play").onclick = speak;
+$("stop").onclick = () => speechSynthesis.cancel();
+speechSynthesis.getVoices(); speechSynthesis.onvoiceschanged = () => {};
+</script>
+</body>
+</html>
